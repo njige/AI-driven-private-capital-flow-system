@@ -1,0 +1,10 @@
+FROM apache/superset:latest
+
+USER root
+RUN pip install --no-cache-dir --target=/app/.venv/lib/python3.10/site-packages psycopg2-binary
+
+# Copy configuration file and set python path
+COPY superset_config.py /app/pythonpath/superset_config.py
+ENV SUPERSET_CONFIG_PATH=/app/pythonpath/superset_config.py
+
+USER superset
