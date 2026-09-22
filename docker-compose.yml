@@ -1,26 +1,103 @@
-version: '3.8'
+# docker-compose.yml — revised
+# Checklist for applying it: APPLY_STEPS.md, row 22.
+#
+# WHAT IS DIFFERENT, AND WHY
+#
+#  1. The MinIO image was repointed. `minio/minio` HAS BEEN DELETED FROM DOCKER
+#     HUB: hub.docker.com/v2/repositories/minio/minio/ answers 404, and a machine
+#     with no cached copy gets
+#         pull access denied for minio/minio, repository does not exist
+#     which reads like a login problem and is not one. Your running container is
+#     unaffected (it is cached); the next fresh machine or `docker compose pull`
+#     is where it bites. Now pinned to the frozen official mirror, and to a tag
+#     rather than a floating one.
+#
+#     Offline / restricted network? Alias the image you already have:
+#         docker image inspect minio/minio:latest --format '{{index .RepoDigests 0}}'
+#         docker tag minio/minio:latest quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+#
+#  2. The Superset service MOUNTS superset_config.py. It is already baked into
+#     the image by Dockerfile.superset (COPY ... /app/pythonpath/), so the file
+#     has been in effect — but that means every config edit needed a rebuild.
+#     The mount below shadows the baked copy, so from now on a config edit is
+#     `docker compose restart superset`. Keep the COPY as well: an image pushed
+#     to a registry has to carry its own config.
+#
+#  3. SUPERSET_SECRET_KEY is now REQUIRED. `${VAR:?}` makes compose stop with a
+#     one-line message before anything starts, instead of Superset crash-looping
+#     under `restart: always`. Put the value in .env (APPLY_STEPS.md, row 11).
+#
+#  4. The bare `SQLALCHEMY_DATABASE_URI` variable is gone. It is not a name
+#     Superset reads: the setting is a Python name in the config file, and this
+#     project's config file reads SUPERSET_SQLALCHEMY_DATABASE_URI. The old line
+#     never did anything — its value merely happened to equal the hardcoded
+#     default inside superset_config.py, so nobody noticed.
+#
+#  5. The reporting-view SQL is no longer mounted into
+#     /docker-entrypoint-initdb.d. Those scripts run only on a FIRST boot with an
+#     EMPTY data directory, and on a first boot the view fails: the tables it
+#     reads are created later, by the backend. The postgres entrypoint exits on a
+#     failing script, so a fresh `docker compose up` would have died at the
+#     database. The file is mounted read-only instead and applied by hand, after
+#     the backend has created its tables (APPLY_STEPS.md, row 10).
+#
+#  6. postgres gained a healthcheck and Superset waits for it. Marquez's database
+#     already had one; the database every other service uses did not.
+#
+#  7. The two Marquez images are pinned to 0.51.1 — the release `:latest` points
+#     at today. `:latest` on a lineage backend whose schema migrates means
+#     "whatever was published this morning".
+#
+#  8. `version: '3.8'` is removed: Compose v2 ignores it and prints a warning.
+#
+# NOTHING HERE DELETES DATA. The three named volumes are untouched, and the
+# postgres password and MinIO credentials are left exactly as they are so the
+# stack you are running right now keeps working. Rotating them is a deliberate
+# step with a procedure (APPLY_STEPS.md, row 22) — not a side effect of pasting
+# this file.
 
 services:
+
   postgres:
     image: postgres:15
     container_name: pcf_postgres
     restart: always
     environment:
       POSTGRES_USER: postgres
+      # postgres/postgres, unchanged on purpose. The password is applied only when
+      # the volume is FIRST created — editing this line later does not change the
+      # password of an existing database. Rotation is three steps: ALTER USER in
+      # psql, this line, and the backend's .env. Doing one of the three breaks the
+      # connection; APPLY_STEPS.md row 22 lists all three.
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: pcf_db
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./scripts/pcf_analytics_view.sql:/docker-entrypoint-initdb.d/01_pcf_analytics_view.sql
+      # Read-only copy inside the container, for you to apply:
+      #   docker compose exec -T postgres psql -U postgres -d pcf_db \
+      #     -f /opt/pcf/pcf_analytics_view.sql
+      # Safe to re-run: the script drops each view before creating it.
+      - ./scripts/pcf_analytics_view.sql:/opt/pcf/pcf_analytics_view.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pcf_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
   minio:
-    image: minio/minio
+    # Was: `image: minio/minio` — no tag (so `latest`) and a repository that no
+    # longer exists. This is MinIO's own frozen mirror, pinned to the last release
+    # it published; the data in minio_data is compatible either way.
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: pcf_minio
     restart: always
     command: server /data --console-address ":9001"
     environment:
+      # The backend's .env holds the same pair — change them together or the app
+      # stops being able to read the filings it stored.
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
       MINIO_BROWSER_LOGIN_ANIMATION: "off"
@@ -29,18 +106,18 @@ services:
       - "9001:9001"
     volumes:
       - minio_data:/data
+    # No healthcheck here on purpose: this image is built on ubi-micro and has no
+    # shell, no curl and no mc, so every healthcheck test I could write would fail
+    # permanently. Nothing depends on MinIO being ready — and never did: the one
+    # service that named it as an upstream (the nginx proxy) is gone.
 
-  # Nginx Reverse Proxy to allow embedding MinIO Console in React <iframe>
-  minio-iframe-proxy:
-    image: nginx:alpine
-    container_name: pcf_minio_proxy
-    restart: always
-    ports:
-      - "9002:80"
-    volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-    depends_on:
-      - minio
+  # minio-iframe-proxy — deleted on purpose. It mounted ./nginx.conf into
+  # /etc/nginx/conf.d/default.conf, and that file is empty: nginx starts, `nginx -t`
+  # passes, NO port is opened, the container stays Up and serves nothing. Nothing in
+  # the app ever pointed at :9002 either — the MinIO pane loads VITE_MINIO_URL
+  # (default http://<host>:9001). If a framed console is ever wanted, probe the
+  # console's own headers first (curl -sI http://<host>:9001/) — the tested proxy
+  # pattern lives in frontend-review/nginx_minio_proxy.conf.
 
   superset:
     build:
@@ -51,10 +128,46 @@ services:
     ports:
       - "8088:8088"
     environment:
-      SUPERSET_SECRET_KEY: "bot_derp_secure_superset_key_2026"
-      SQLALCHEMY_DATABASE_URI: "postgresql+psycopg2://postgres:postgres@postgres:5432/pcf_db"
+      # Mounted below, and named here, so which file Superset loads is not a
+      # question of what happens to be on the image's PYTHONPATH.
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+
+      # REQUIRED — compose stops here if it is missing:
+      #   echo "SUPERSET_SECRET_KEY=$(openssl rand -base64 42)" >> .env
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:?set SUPERSET_SECRET_KEY in .env — see APPLY_STEPS.md row 11}
+
+      # Read by superset_config.py (the PREFIXED name; the bare one is read by
+      # nothing). The default keeps Superset's own objects — dashboards, charts,
+      # users, the pcf_db connection — exactly where they are today.
+      # Move to a dedicated database when convenient:
+      #     CREATE DATABASE superset_metadata;
+      #     SUPERSET_SQLALCHEMY_DATABASE_URI=postgresql+psycopg2://postgres:postgres@postgres:5432/superset_metadata
+      #     docker compose exec superset superset db upgrade && superset init
+      # (and copy the existing superset_* tables across, or the dashboards go with
+      # the old database). Then set the acknowledgement below to 0.
+      SUPERSET_SQLALCHEMY_DATABASE_URI: ${SUPERSET_SQLALCHEMY_DATABASE_URI:-postgresql+psycopg2://postgres:postgres@postgres:5432/pcf_db}
+      SUPERSET_ALLOW_SHARED_METADATA_DB: ${SUPERSET_ALLOW_SHARED_METADATA_DB:-1}
+
+      # Optional, all defaulted inside superset_config.py — uncomment to use:
+      # SUPERSET_FRAME_ANCESTORS: "http://localhost:5173 http://127.0.0.1:5173"
+      # SUPERSET_GUEST_TOKEN_JWT_SECRET: <openssl rand -base64 42>
+      # SUPERSET_ALLOW_ANON_GAMMA: "1"     restores the old anonymous role, loudly
+      # SUPERSET_HTTPS: "1"                when TLS is terminated in front
+    volumes:
+      # Wins over the copy baked into the image, so a config edit is a restart
+      # (`docker compose restart superset`) rather than a rebuild.
+      - ./superset_config.py:/app/pythonpath/superset_config.py:ro
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # 200 = healthy. `/health` also answers 500 when Superset is up but has
+      # warnings — that is not the same thing as the container being down.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/health', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
 
   # OpenLineage Backend Metadata Database
   marquez-db:
@@ -67,10 +180,16 @@ services:
       POSTGRES_DB: marquez
     volumes:
       - marquez_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U marquez -d marquez"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   # OpenLineage API Server
   marquez:
-    image: marquezproject/marquez:latest
+    # Was :latest — which is 0.51.1 today, and is a different version tomorrow.
+    image: marquezproject/marquez:0.51.1
     container_name: pcf_marquez
     restart: always
     ports:
@@ -82,11 +201,12 @@ services:
       - POSTGRES_PASSWORD=marquez
       - POSTGRES_DB=marquez
     depends_on:
-      - marquez-db
+      marquez-db:
+        condition: service_healthy
 
   # OpenLineage Web UI Interface
   marquez-web:
-    image: marquezproject/marquez-web:latest
+    image: marquezproject/marquez-web:0.51.1
     container_name: pcf_marquez_web
     restart: always
     ports:

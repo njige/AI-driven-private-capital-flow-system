@@ -1,5 +1,17 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import { getSubmissions, clearSubmissions, commitAuditDecision } from '../../services/api';
+import  AuditReview  from './AuditReview';
+
+// ══════════════════════════════════════════════════════════════════════════
+//  ⚙️  CHOOSE THE ENDPOINT THAT ACTUALLY SERVES THE PDF
+//      'api'    ->  {base}/api/v1/ingest/document-file/{filingId}   (default)
+//      'static' ->  {base}/files/{filename}
+//  The modal was calling the 'api' route and got a meaningful JSON 404 back
+//  ("...not found on server"), which means that route EXISTS — so 'api' is the
+//  best first guess. If it 404s with a REAL id, switch to 'static'.
+//  ⚠️ This constant must stay identical in Overview.tsx and AuditReview.tsx.
+// ══════════════════════════════════════════════════════════════════════════
+const DOCUMENT_ENDPOINT: 'api' | 'static' = 'api';
 
 // --- Interfaces ---
 export interface LineItem {
@@ -20,13 +32,135 @@ export interface SubmissionRecord {
   bpm6_category?: string;
   total_usd?: number;
   total_tzs?: number;
+  total_assets_usd?: number;
+  total_assets_tzs?: number;
+  extracted_payload?: {
+    total_usd?: number;
+    total_tzs?: number;
+    total_assets_usd?: number;
+    total_assets_tzs?: number;
+    filing_id?: string;
+    [key: string]: any;
+  };
   vlm_score?: string;
   confidence_score?: number;
   status: string;
   audit_notes?: string;
   file_url?: string;
   line_items?: LineItem[];
+  // Added after the "undefined not found on server" bug — the modal was reading
+  // `.id` only, while the API returns the identifier under filing_id.
+  submission_ref?: string;
+  document_name?: string;
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * SHARED HELPERS
+ * This block is duplicated verbatim in Overview.tsx and AuditReview.tsx so
+ * both files are self-contained and paste-ready. If you later want a single
+ * copy, move it to src/lib/filingDocument.ts and import it in both.
+ * ⚠️ KEEP THE TWO COPIES IN SYNC.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+// Checked most-specific first.
+const ID_KEYS = [
+  'filing_id', 'filingId', 'submission_id', 'submissionId',
+  'submission_ref', 'record_id', 'recordId', 'uuid', '_id', 'id',
+] as const;
+
+// Some APIs nest the identifier inside the extraction payload instead.
+const NESTED_KEYS = [
+  'extracted_payload', 'payload', 'metadata', 'filing', 'submission', 'record',
+] as const;
+
+const looksLikeId = (v: unknown): v is string =>
+  typeof v === 'string' && v.trim().length > 0 && v !== 'undefined' && v !== 'null';
+
+/**
+ * Extract the filing identifier from whatever shape the API returns.
+ * Returns null when nothing usable exists, so the literal string "undefined"
+ * can never end up in a URL again.
+ */
+export function resolveFilingId(record: any): string | null {
+  if (!record) return null;
+
+  for (const key of ID_KEYS) {
+    if (looksLikeId((record as any)[key])) return (record as any)[key].trim();
+  }
+
+  for (const parent of NESTED_KEYS) {
+    const node = (record as any)[parent];
+    if (node && typeof node === 'object') {
+      for (const key of ID_KEYS) {
+        if (looksLikeId(node[key])) return (node as any)[key].trim();
+      }
+    }
+  }
+
+  // Numeric ids: 0 is falsy, so check the type explicitly.
+  for (const key of ID_KEYS) {
+    const v = (record as any)[key];
+    if (typeof v === 'number' && Number.isFinite(v)) return String(v);
+  }
+
+  return null;
+}
+
+const trimSlash = (s: string) => s.replace(/\/+$/, '');
+
+/**
+ * API base. Honours VITE_API_BASE_URL, otherwise targets the CURRENT hostname
+ * on port 8000 — never a hardcoded 127.0.0.1, which would point at the
+ * viewer's own machine when the dashboard is opened from anywhere else.
+ */
+export function resolveApiBase(): string {
+  const env = (import.meta as any)?.env?.VITE_API_BASE_URL;
+  if (env !== undefined && env !== null) return trimSlash(String(env));
+  const host = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
+  return `http://${host}:8000`;
+}
+
+/** Filename used by the 'static' route. */
+function staticFilename(record: any, filingId: string): string {
+  const raw = typeof record?.file_url === 'string' ? record.file_url.trim() : '';
+  if (!raw) return `${filingId}_document.pdf`;
+  const filename = raw.split('/').pop() || '';
+  if (!filename) return `${filingId}_document.pdf`;
+  return filename.startsWith(filingId) ? filename : `${filingId}_${filename}`;
+}
+
+/**
+ * Build the document URL, or null when there is nothing safe to request.
+ * An absolute file_url supplied by the API always wins.
+ */
+export function resolveDocumentUrl(
+  record: any,
+  endpoint: 'api' | 'static' = DOCUMENT_ENDPOINT,
+): string | null {
+  if (!record) return null;
+
+  if (typeof record.file_url === 'string' && /^https?:\/\//i.test(record.file_url)) {
+    return record.file_url;
+  }
+
+  const filingId = resolveFilingId(record);
+  const base = resolveApiBase();
+
+  if (endpoint === 'api') {
+    return filingId
+      ? `${base}/api/v1/ingest/document-file/${encodeURIComponent(filingId)}`
+      : null;
+  }
+
+  if (!filingId) return null;
+  return `${base}/files/${encodeURIComponent(staticFilename(record, filingId))}`;
+}
+
+/** Backwards-compatible alias — other files may still import this name. */
+export const resolvePdfUrl = (record: SubmissionRecord): string | null =>
+  resolveDocumentUrl(record);
+
+/* ══════════════════════════════════════════════════════════════════════════ */
 
 export const Overview: React.FC = () => {
   const [submissions, setSubmissions] = useState<SubmissionRecord[]>([]);
@@ -37,11 +171,11 @@ export const Overview: React.FC = () => {
   const [statusFilter, setStatusFilter] = useState<string>('ALL');
   const [selectedAuditRecord, setSelectedAuditRecord] = useState<SubmissionRecord | null>(null);
 
-  const fetchSubmissions = async () => {
+  const fetchSubmissions = useCallback(async () => {
     try {
       setLoading(true);
       const resData = await getSubmissions();
-      const finalArray = Array.isArray(resData) ? resData : (resData?.data || []);
+      const finalArray = Array.isArray(resData) ? resData : resData?.data || [];
       setSubmissions(finalArray);
       setError(null);
     } catch (err) {
@@ -50,12 +184,16 @@ export const Overview: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
   const handleClearAll = async () => {
     if (window.confirm('Are you sure you want to clear all test records?')) {
-      await clearSubmissions();
-      fetchSubmissions();
+      try {
+        await clearSubmissions();
+        await fetchSubmissions();
+      } catch (err) {
+        console.error('Failed to clear submissions:', err);
+      }
     }
   };
 
@@ -65,12 +203,21 @@ export const Overview: React.FC = () => {
     bpm6Category: string;
     economistNotes: string;
     auditStatus: string;
+    // NOTE: was typed LineItem[], but AuditReview sends shareholders or
+    // industrial classifications, which have different fields entirely.
+    // The value is forwarded unchanged, exactly as before. Either map it to
+    // { description, amount_tzs, amount_usd } on the way out, or change the
+    // API contract to match reality — but do it deliberately.
+    lineItems: any[];
+    // ADDED. The full edited questionnaire from the review screen. Forwarded as
+    // extracted_payload_override so the reviewer's edits are not discarded.
+    payload: Record<string, any>;
   }) => {
     if (!selectedAuditRecord) return;
 
     try {
       setSubmittingAudit(true);
-      const targetId = selectedAuditRecord.filing_id || selectedAuditRecord.submission_id || selectedAuditRecord.id;
+      const targetId = resolveFilingId(selectedAuditRecord);
 
       if (!targetId) {
         alert('Missing filing ID for submission.');
@@ -82,7 +229,12 @@ export const Overview: React.FC = () => {
         tin_number: auditForm.tinNumber,
         bpm6_category: auditForm.bpm6Category,
         economist_notes: auditForm.economistNotes,
-        status: auditForm.auditStatus
+        status: auditForm.auditStatus,
+        line_items: auditForm.lineItems,
+        // ADDED. Without this the backend updated the six audit columns and left
+        // extracted_payload untouched, so every edit made in the review screen
+        // was lost on Approve. The backend re-validates it before storing.
+        extracted_payload_override: auditForm.payload,
       });
 
       setSelectedAuditRecord(null);
@@ -97,22 +249,25 @@ export const Overview: React.FC = () => {
 
   useEffect(() => {
     fetchSubmissions();
-  }, []);
+  }, [fetchSubmissions]);
 
-  const filteredSubmissions = submissions.filter((item) => {
-    const company = item.investor_entity || item.company_name || '';
-    const filingId = item.filing_id || item.submission_id || item.id || '';
-    const category = item.bpm6_category || '';
+  const filteredSubmissions = useMemo(() => {
+    return submissions.filter((item) => {
+      const company = item.investor_entity || item.company_name || '';
+      const filingId = resolveFilingId(item) || '';
+      const category = item.bpm6_category || '';
 
-    const matchesSearch =
-      company.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      filingId.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      category.toLowerCase().includes(searchQuery.toLowerCase());
+      const query = searchQuery.toLowerCase();
+      const matchesSearch =
+        company.toLowerCase().includes(query) ||
+        filingId.toLowerCase().includes(query) ||
+        category.toLowerCase().includes(query);
 
-    const matchesStatus = statusFilter === 'ALL' || item.status === statusFilter;
+      const matchesStatus = statusFilter === 'ALL' || item.status === statusFilter;
 
-    return matchesSearch && matchesStatus;
-  });
+      return matchesSearch && matchesStatus;
+    });
+  }, [submissions, searchQuery, statusFilter]);
 
   return (
     <div className="flex flex-col h-full space-y-4 overflow-hidden min-h-0">
@@ -165,7 +320,14 @@ export const Overview: React.FC = () => {
           >
             <option value="ALL">All Submissions</option>
             <option value="PROCESSED_BY_AI">Processed by AI</option>
+            {/* The rules engine also emits PROCESSED_WITH_ALERTS — currently only
+                for filings above the high-value threshold. Without this option
+                those records appeared under "All Submissions" and nowhere else,
+                so an economist filtering for work to review never saw them. */}
+            <option value="PROCESSED_WITH_ALERTS">Processed with Alerts</option>
             <option value="APPROVED">Approved</option>
+            {/* Reject sets this status in AuditReview, so it needs to be filterable */}
+            <option value="REJECTED">Rejected</option>
             <option value="FLAGGED">Flagged for Audit</option>
           </select>
         </div>
@@ -197,12 +359,18 @@ export const Overview: React.FC = () => {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200 text-xs">
-                {filteredSubmissions.map((record) => {
-                  const recordKey = record.filing_id || record.submission_id || record.id || Math.random().toString();
+                {filteredSubmissions.map((record, index) => {
+                  const realFilingId = resolveFilingId(record);
+                  const displayId = realFilingId || `record_${index}`;
+                  const pdfUrl = resolvePdfUrl(record);
+
+                  const resolvedTotalUsd = record.total_usd ?? record.extracted_payload?.total_usd ?? record.total_assets_usd ?? 0;
+                  const resolvedTotalTzs = record.total_tzs ?? record.extracted_payload?.total_tzs ?? record.total_assets_tzs ?? 0;
+
                   return (
-                    <tr key={recordKey} className="hover:bg-slate-50/80 transition-colors">
+                    <tr key={displayId} className="hover:bg-slate-50/80 transition-colors">
                       <td className="px-3 py-2.5 font-mono font-medium text-emerald-800 whitespace-nowrap">
-                        {record.filing_id || record.submission_id || record.id}
+                        {displayId}
                       </td>
                       <td className="px-3 py-2.5 max-w-xs">
                         <div className="font-semibold text-slate-900 truncate">
@@ -219,21 +387,40 @@ export const Overview: React.FC = () => {
                         {record.bpm6_category || 'Unclassified'}
                       </td>
                       <td className="px-3 py-2.5 text-right font-mono font-medium text-slate-900 whitespace-nowrap">
-                        ${(record.total_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                        ${resolvedTotalUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })}
                       </td>
                       <td className="px-3 py-2.5 text-right font-mono text-slate-600 whitespace-nowrap">
-                        {(record.total_tzs ?? 0).toLocaleString()} TZS
+                        {resolvedTotalTzs.toLocaleString()} TZS
                       </td>
+
+                      {/* VLM SCORE — was `{record.vlm_score || '98.5%'}`, which
+                          displayed a hardcoded 98.5% on every filing whose score
+                          was missing (including ones that failed extraction).
+                          That manufactured false assurance, so an absent score
+                          now says so. */}
                       <td className="px-3 py-2.5 text-center whitespace-nowrap">
-                        <span className="inline-block px-1.5 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded font-semibold text-[11px]">
-                          {record.vlm_score || '98.5%'}
-                        </span>
+                        {record.vlm_score ? (
+                          <span className="inline-block px-1.5 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded font-semibold text-[11px]">
+                            {record.vlm_score}
+                          </span>
+                        ) : record.confidence_score ? (
+                          <span className="inline-block px-1.5 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded font-semibold text-[11px]">
+                            {(record.confidence_score * 100).toFixed(1)}%
+                          </span>
+                        ) : (
+                          <span className="inline-block px-1.5 py-0.5 bg-slate-100 text-slate-500 border border-slate-300 rounded font-semibold text-[11px]">
+                            not scored
+                          </span>
+                        )}
                       </td>
+
                       <td className="px-3 py-2.5 text-center whitespace-nowrap">
                         <span
                           className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-bold ${
                             record.status === 'APPROVED'
                               ? 'bg-emerald-100 text-emerald-800'
+                              : record.status === 'REJECTED'
+                              ? 'bg-slate-200 text-slate-700'
                               : record.status === 'FLAGGED'
                               ? 'bg-rose-100 text-rose-800'
                               : 'bg-amber-100 text-amber-800'
@@ -242,11 +429,13 @@ export const Overview: React.FC = () => {
                           {record.status}
                         </span>
                       </td>
-                      {/* Direct Link to Raw Document */}
+
+                      {/* RAW DOC — only links when a real identifier exists,
+                          otherwise a real request would go to .../undefined. */}
                       <td className="px-3 py-2.5 text-center whitespace-nowrap">
-                        {record.file_url ? (
+                        {pdfUrl ? (
                           <a
-                            href={record.file_url}
+                            href={pdfUrl}
                             target="_blank"
                             rel="noopener noreferrer"
                             className="px-2 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded text-[11px] font-semibold hover:bg-emerald-100 transition-colors inline-flex items-center gap-1"
@@ -254,9 +443,15 @@ export const Overview: React.FC = () => {
                             📄 View PDF
                           </a>
                         ) : (
-                          <span className="text-slate-400 text-[10px]">No File</span>
+                          <span
+                            title="This record has no filing_id / submission_id / id, so no document URL can be built."
+                            className="px-2 py-1 bg-slate-100 text-slate-400 border border-slate-200 rounded text-[11px] font-semibold cursor-not-allowed inline-flex items-center gap-1"
+                          >
+                            📄 No doc
+                          </span>
                         )}
                       </td>
+
                       <td className="px-3 py-2.5 text-center whitespace-nowrap">
                         <button
                           onClick={() => setSelectedAuditRecord(record)}
@@ -274,259 +469,15 @@ export const Overview: React.FC = () => {
         )}
       </div>
 
-      {/* Modal Audit Workbench Sub-component */}
+      {/* Modal Audit Workbench */}
       {selectedAuditRecord && (
-        <AuditModal
+        <AuditReview
           record={selectedAuditRecord}
           isSubmitting={submittingAudit}
           onClose={() => setSelectedAuditRecord(null)}
           onSave={handleSaveAudit}
         />
       )}
-    </div>
-  );
-};
-
-// Extracted Audit Modal Component
-interface AuditModalProps {
-  record: SubmissionRecord;
-  isSubmitting: boolean;
-  onClose: () => void;
-  onSave: (form: {
-    companyName: string;
-    tinNumber: string;
-    bpm6Category: string;
-    economistNotes: string;
-    auditStatus: string;
-  }) => void;
-}
-
-const AuditModal: React.FC<AuditModalProps> = ({ record, isSubmitting, onClose, onSave }) => {
-  const [form, setForm] = useState({
-    companyName: record.investor_entity || record.company_name || '',
-    tinNumber: record.tin_number || '',
-    bpm6Category: record.bpm6_category || 'Foreign Direct Investment (FDI) - Equity',
-    economistNotes: record.audit_notes || '',
-    auditStatus: record.status === 'FLAGGED' ? 'FLAGGED' : 'APPROVED'
-  });
-
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
-
-  return (
-    <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4 z-50 overflow-hidden">
-      <div className="bg-white rounded-xl shadow-2xl w-[96vw] h-[92vh] border border-slate-300 flex flex-col overflow-hidden">
-        <div className="bg-slate-900 text-white px-5 py-3 flex justify-between items-center shrink-0">
-          <div className="flex items-center gap-3">
-            <span className="bg-emerald-600 text-white text-xs px-2 py-0.5 rounded font-mono font-bold">
-              {record.filing_id || record.submission_id || record.id}
-            </span>
-            <h2 className="text-base font-bold">Interactive Verification & Manual Audit Workbench</h2>
-          </div>
-
-          <button
-            onClick={onClose}
-            className="bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white px-2.5 py-1 rounded text-xs font-bold transition-colors"
-          >
-            ✕ Close
-          </button>
-        </div>
-
-        <div className="flex-1 flex overflow-hidden divide-x divide-slate-200 min-h-0">
-          {/* Document Preview */}
-          <div className="w-1/2 bg-slate-100 flex flex-col h-full overflow-hidden">
-            <div className="p-2.5 bg-slate-200 border-b border-slate-300 flex justify-between items-center text-xs shrink-0">
-              <span className="font-bold text-slate-700 uppercase tracking-wider">📄 Submitted Document Source</span>
-              <span className="text-slate-500 font-mono">{record.document_type || 'Statutory Return'}</span>
-            </div>
-
-            <div className="flex-1 p-3 overflow-auto flex justify-center items-center">
-              {record.file_url ? (
-                <iframe src={record.file_url} className="w-full h-full rounded border border-slate-300 bg-white" title="Submitted Document" />
-              ) : (
-                <div className="w-full h-full max-w-md bg-white p-6 rounded-lg border border-slate-300 shadow-sm flex flex-col justify-between text-slate-800 text-xs overflow-y-auto">
-                  <div className="border-b-2 border-slate-800 pb-3 mb-3 text-center">
-                    <h4 className="font-bold text-xs tracking-widest uppercase">Bank of Tanzania</h4>
-                    <p className="text-[9px] text-slate-500 uppercase">Capital Flow Statutory Return Form</p>
-                  </div>
-
-                  <div className="space-y-2 text-xs">
-                    <div className="flex justify-between border-b pb-1">
-                      <span className="font-semibold text-slate-500">Reporting Entity:</span>
-                      <span className="font-bold text-slate-900">{record.investor_entity || record.company_name}</span>
-                    </div>
-                    <div className="flex justify-between border-b pb-1">
-                      <span className="font-semibold text-slate-500">TIN:</span>
-                      <span className="font-mono text-slate-900">{record.tin_number || 'N/A'}</span>
-                    </div>
-                    <div className="flex justify-between border-b pb-1">
-                      <span className="font-semibold text-slate-500">Reporting Period:</span>
-                      <span className="text-slate-900">{record.reporting_period || 'Q2 2026'}</span>
-                    </div>
-                    <div className="flex justify-between border-b pb-1">
-                      <span className="font-semibold text-slate-500">Declared Category:</span>
-                      <span className="text-slate-900 font-medium">{record.bpm6_category}</span>
-                    </div>
-
-                    <div className="mt-4 pt-1">
-                      <span className="font-semibold text-slate-600 block mb-1">Declared Line Items:</span>
-                      <div className="bg-slate-50 p-2 rounded border border-slate-200 space-y-1 font-mono text-[10px]">
-                        <div className="flex justify-between font-bold text-slate-700">
-                          <span>Description</span>
-                          <span>USD Equivalent</span>
-                        </div>
-                        <div className="flex justify-between text-slate-600">
-                          <span>Capital Equity Injection</span>
-                          <span>${(record.total_usd ?? 0).toLocaleString()}</span>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="mt-6 pt-3 border-t text-center text-[9px] text-slate-400">
-                    Official Statutory Return Document Rendering Preview
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* Form Side */}
-          <div className="w-1/2 bg-white flex flex-col h-full overflow-y-auto p-5 space-y-4 text-xs">
-            <div className="bg-slate-50 p-3 rounded-lg border border-slate-200 shrink-0">
-              <div className="flex justify-between items-center mb-1">
-                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">AI Vision Extraction Confidence</span>
-                <span className="px-2 py-0.5 bg-emerald-100 text-emerald-800 border border-emerald-300 rounded font-bold text-[10px]">
-                  VLM Score: {record.vlm_score || '98.5%'}
-                </span>
-              </div>
-              <p className="text-xs text-slate-600 leading-relaxed">
-                <strong>AI Notes:</strong> {record.audit_notes || 'Extracted successfully by backend vision pipeline.'}
-              </p>
-            </div>
-
-            <div>
-              <h3 className="text-xs font-bold text-slate-900 mb-2 uppercase tracking-wider border-b pb-1">
-                Economist Manual Overrides & Data Verification
-              </h3>
-
-              <div className="space-y-3">
-                <div>
-                  <label className="block font-semibold text-slate-700 mb-1">Investor Company Name</label>
-                  <input
-                    type="text"
-                    value={form.companyName}
-                    onChange={(e) => setForm({ ...form, companyName: e.target.value })}
-                    className="w-full px-2.5 py-1.5 border border-slate-300 rounded-lg text-xs focus:ring-2 focus:ring-emerald-500 focus:outline-none"
-                  />
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block font-semibold text-slate-700 mb-1">TIN Number</label>
-                    <input
-                      type="text"
-                      value={form.tinNumber}
-                      onChange={(e) => setForm({ ...form, tinNumber: e.target.value })}
-                      className="w-full px-2.5 py-1.5 border border-slate-300 rounded-lg text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block font-semibold text-slate-700 mb-1">BPM6 Category Re-Classification</label>
-                    <select
-                      value={form.bpm6Category}
-                      onChange={(e) => setForm({ ...form, bpm6Category: e.target.value })}
-                      className="w-full px-2.5 py-1.5 border border-slate-300 rounded-lg text-xs bg-white focus:ring-2 focus:ring-emerald-500 focus:outline-none"
-                    >
-                      <option value="Foreign Direct Investment (FDI) - Equity">Foreign Direct Investment (FDI) - Equity</option>
-                      <option value="Portfolio Investment - Equity">Portfolio Investment - Equity</option>
-                      <option value="Foreign Debt / Long-term Loans">Foreign Debt / Long-term Loans</option>
-                      <option value="Other Investment / Trade Credits">Other Investment / Trade Credits</option>
-                    </select>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3 p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
-                  <div>
-                    <span className="text-[10px] text-slate-500 block font-semibold">Total Amount USD</span>
-                    <span className="text-sm font-mono font-bold text-slate-900">
-                      ${(record.total_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-[10px] text-slate-500 block font-semibold">Total Amount TZS</span>
-                    <span className="text-sm font-mono font-bold text-slate-900">
-                      {(record.total_tzs ?? 0).toLocaleString()} TZS
-                    </span>
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block font-semibold text-slate-700 mb-1">Manual Audit Findings & Remarks</label>
-                  <textarea
-                    rows={2}
-                    placeholder="Enter formal BoT audit notes or risk observations..."
-                    value={form.economistNotes}
-                    onChange={(e) => setForm({ ...form, economistNotes: e.target.value })}
-                    className="w-full px-2.5 py-1.5 border border-slate-300 rounded-lg text-xs focus:ring-2 focus:ring-emerald-500 focus:outline-none"
-                  />
-                </div>
-
-                <div>
-                  <label className="block font-semibold text-slate-700 mb-1">Audit Decision Status</label>
-                  <div className="flex gap-4">
-                    <label className="flex items-center gap-1.5 cursor-pointer font-medium text-slate-700">
-                      <input
-                        type="radio"
-                        name="auditStatus"
-                        value="APPROVED"
-                        checked={form.auditStatus === 'APPROVED'}
-                        onChange={(e) => setForm({ ...form, auditStatus: e.target.value })}
-                        className="text-emerald-600 focus:ring-emerald-500"
-                      />
-                      Approve Filing
-                    </label>
-                    <label className="flex items-center gap-1.5 cursor-pointer font-medium text-slate-700">
-                      <input
-                        type="radio"
-                        name="auditStatus"
-                        value="FLAGGED"
-                        checked={form.auditStatus === 'FLAGGED'}
-                        onChange={(e) => setForm({ ...form, auditStatus: e.target.value })}
-                        className="text-amber-600 focus:ring-amber-500"
-                      />
-                      Flag for Deep Risk Investigation
-                    </label>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div className="pt-3 border-t border-slate-200 flex justify-end gap-2 mt-auto shrink-0">
-              <button
-                onClick={onClose}
-                disabled={isSubmitting}
-                className="px-3 py-2 bg-slate-100 text-slate-700 rounded-lg text-xs font-semibold hover:bg-slate-200 transition-colors disabled:opacity-50"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => onSave(form)}
-                disabled={isSubmitting}
-                className="px-4 py-2 bg-emerald-700 text-white rounded-lg text-xs font-bold hover:bg-emerald-800 transition-colors shadow-sm disabled:opacity-50"
-              >
-                {isSubmitting ? 'Saving...' : 'Save & Commit Decision'}
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
     </div>
   );
 };

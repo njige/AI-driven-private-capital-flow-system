@@ -1,7 +1,84 @@
-FROM apache/superset:latest
+# Dockerfile.superset — revised
+#
+# WHAT CHANGED, AND WHY
+#
+#  1. The psycopg2 install no longer names a Python version.
+#
+#     Was:  pip install --target=/app/.venv/lib/python3.10/site-packages psycopg2-binary
+#
+#     `python3.10` is not a path you control — it is whatever Python the base
+#     image was built with, and `apache/superset:latest` moves. If the image is
+#     3.11 or 3.12, pip creates that python3.10 directory anyway and installs
+#     into it, silently, somewhere the interpreter never looks. The install
+#     "succeeds"; the driver is then either absent (ModuleNotFoundError at the
+#     first query) or coming from somewhere else entirely. Both are worse than
+#     a build that fails.
+#
+#     This version installs with the venv's own interpreter and then PROVES the
+#     import in the same layer, so a driver that lands in the wrong place fails
+#     the build instead of a database connection three weeks later.
+#
+#  2. It is worth checking whether this line is needed at all. The official
+#     image installs the postgres extra itself (`.[postgres,mysql,...]` in the
+#     upstream Dockerfile), so psycopg2 may already be importable:
+#
+#         docker compose exec superset python -c \
+#           "import sys, psycopg2; print(sys.version.split()[0], psycopg2.__file__)"
+#
+#     A path under /app/.venv/lib/python3.X/site-packages means the driver is
+#     there and this RUN line can be deleted. (If it is a /usr/local/... path,
+#     you are importing the system copy — also fine on this image.)
+#
+#  3. The base image is NOT pinned below, and it should be. `apache/superset:latest`
+#     was last pushed to Docker Hub on 2026-09-07, so the next `build` pulls a
+#     different Superset than the one running now — and rebuilding at the same
+#     time as a config change means debugging two things at once. Find out what
+#     you are running and pin it:
+#
+#         docker compose exec superset superset version
+#
+#     then put that version in the FROM line (the current release is 6.1.0).
+#     The image ID you already have is the honest record of today:
+#
+#         docker image inspect apache/superset:latest --format '{{.Id}}'
+#
+#  4. The config COPY and SUPERSET_CONFIG_PATH are unchanged — deliberately.
+#     That pair is what has been loading your superset_config.py all along. The
+#     revised docker-compose.yml also MOUNTS the same path, and the mount wins,
+#     so config edits stop needing a rebuild — but the COPY stays, because an
+#     image pushed to a registry must carry its own config.
+#
+#  5. If you already built and pushed an image from this Dockerfile, the old
+#     superset_config.py — the one with the secret key written into it — is
+#     inside that image's layers. Rotating SUPERSET_SECRET_KEY is what makes
+#     that copy worthless; nothing else you do removes it.
+#
+#  6. This file does NOT run `superset db upgrade` or `superset init`. Those are
+#     not build steps: they talk to the metadata database and belong with the
+#     running container. Run them when the database is new, or after upgrading
+#     Superset:
+#
+#         docker compose exec superset superset db upgrade
+#         docker compose exec superset superset init
+#
+#  7. Nothing here is a security boundary — but one habit is worth it: the build
+#     context is the whole project folder. Today the only COPY is of
+#     superset_config.py, so nothing else can leak into an image. If a
+#     `.dockerignore` is ever added, put `node_modules`, `.env`, `storage/`,
+#     `dist` and `.git` in it before someone writes `COPY . .` — `.env` is about
+#     to hold your secret key.
+
+FROM apache/superset:latest        # TODO: pin to the version `superset version` reports
 
 USER root
-RUN pip install --no-cache-dir --target=/app/.venv/lib/python3.10/site-packages psycopg2-binary
+
+# Install into the venv Superset itself runs from, and fail the build if the
+# import does not come from there. No pythonX.Y anywhere.
+RUN /app/.venv/bin/python -m pip install --no-cache-dir psycopg2-binary \
+ && /app/.venv/bin/python -c "import psycopg2, sys; print('psycopg2', psycopg2.__version__, 'for python', sys.version.split()[0], '->', psycopg2.__file__)"
+# If the build stops with "No module named pip", this image's venv has no pip.
+# Use the uv that the official image installs instead:
+#   RUN uv pip install --python /app/.venv/bin/python --no-cache-dir psycopg2-binary
 
 # Copy configuration file and set python path
 COPY superset_config.py /app/pythonpath/superset_config.py

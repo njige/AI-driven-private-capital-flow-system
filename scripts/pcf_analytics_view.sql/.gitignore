@@ -2,17 +2,28 @@
 .env
 *.env
 
+# Storage & Raw Document Uploads
+/storage/raw_documents/*
+/storage/*
+!.gitkeep
+
 # Python / Virtual Envs
 __pycache__/
 *.py[cod]
+*$py.class
+.pytest_cache/
 .venv/
 venv/
+env/
 
-# Node / React
+# Node / React Frontend
 node_modules/
 dist/
 build/
+.eslintcache
 
 # OS / IDE Files
 .DS_Store
+Thumbs.db
 .vscode/
+.idea/
